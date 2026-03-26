@@ -362,7 +362,6 @@ fn main() {
     let args = ErofsArgs::parse();
     let file = File::options()
         .read(true)
-        .write(true)
         .open(Path::new(&args.image))
         .unwrap();
     let filesystem =
