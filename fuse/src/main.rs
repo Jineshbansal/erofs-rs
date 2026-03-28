@@ -21,6 +21,7 @@ use std::fs::File;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
+use std::process;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -93,22 +94,22 @@ fn system_time_from_time(secs: i64, nsecs: u32) -> SystemTime {
     }
 }
 
-fn file_type_from_type(ty: Type) -> FileType {
+fn file_type_from_type(ty: Type) -> PosixResult<FileType> {
     match ty {
-        Type::Regular => FileType::RegularFile,
-        Type::Directory => FileType::Directory,
-        Type::Link => FileType::Symlink,
-        Type::Fifo => FileType::NamedPipe,
-        Type::Character => FileType::CharDevice,
-        Type::Block => FileType::BlockDevice,
-        Type::Socket => FileType::Socket,
-        Type::Unknown => panic!("Unknown Type"),
+        Type::Regular => Ok(FileType::RegularFile),
+        Type::Directory => Ok(FileType::Directory),
+        Type::Link => Ok(FileType::Symlink),
+        Type::Fifo => Ok(FileType::NamedPipe),
+        Type::Character => Ok(FileType::CharDevice),
+        Type::Block => Ok(FileType::BlockDevice),
+        Type::Socket => Ok(FileType::Socket),
+        Type::Unknown => Err(EUCLEAN),
     }
 }
 
-fn get_file_attr_from_filesystem_inode(inode: &SimpleInode, sb: &SuperBlock) -> FileAttr {
+fn get_file_attr_from_filesystem_inode(inode: &SimpleInode, sb: &SuperBlock) -> PosixResult<FileAttr> {
     match *inode.info() {
-        InodeInfo::Extended(e) => FileAttr {
+        InodeInfo::Extended(e) => Ok(FileAttr {
             atime: system_time_from_time(e.i_mtime as i64, e.i_mtime_nsec),
             ino: inode.nid() + FUSE_ROOT_ID,
             size: e.i_size,
@@ -117,15 +118,15 @@ fn get_file_attr_from_filesystem_inode(inode: &SimpleInode, sb: &SuperBlock) -> 
             ctime: system_time_from_time(e.i_mtime as i64, e.i_mtime_nsec),
             crtime: system_time_from_time(e.i_mtime as i64, e.i_mtime_nsec),
             perm: inode.info().inode_perm(),
-            kind: file_type_from_type(inode.info().inode_type()),
+            kind: file_type_from_type(inode.info().inode_type())?,
             nlink: e.i_nlink,
             blksize: 512,
             uid: e.i_uid,
             gid: e.i_gid,
             rdev: 0,
             flags: 0,
-        },
-        InodeInfo::Compact(c) => FileAttr {
+        }),
+        InodeInfo::Compact(c) => Ok(FileAttr {
             atime: system_time_from_time(sb.build_time, sb.build_time_nsec as u32),
             ino: inode.nid() + FUSE_ROOT_ID,
             size: c.i_size as u64,
@@ -134,27 +135,27 @@ fn get_file_attr_from_filesystem_inode(inode: &SimpleInode, sb: &SuperBlock) -> 
             ctime: system_time_from_time(sb.build_time, sb.build_time_nsec as u32),
             crtime: system_time_from_time(sb.build_time, sb.build_time_nsec as u32),
             perm: inode.info().inode_perm(),
-            kind: file_type_from_type(inode.info().inode_type()),
+            kind: file_type_from_type(inode.info().inode_type())?,
             nlink: c.i_nlink as u32,
             blksize: 512,
             uid: c.i_uid as u32,
             gid: c.i_gid as u32,
             rdev: 0,
             flags: 0,
-        },
+        }),
     }
 }
 
-fn filetype_from_dtype(ty: u8) -> FileType {
+fn filetype_from_dtype(ty: u8) -> PosixResult<FileType> {
     match ty {
-        1 => FileType::RegularFile,
-        2 => FileType::Directory,
-        3 => FileType::CharDevice,
-        4 => FileType::BlockDevice,
-        5 => FileType::NamedPipe,
-        6 => FileType::Socket,
-        7 => FileType::Symlink,
-        _ => panic!("unknown"),
+        1 => Ok(FileType::RegularFile),
+        2 => Ok(FileType::Directory),
+        3 => Ok(FileType::CharDevice),
+        4 => Ok(FileType::BlockDevice),
+        5 => Ok(FileType::NamedPipe),
+        6 => Ok(FileType::Socket),
+        7 => Ok(FileType::Symlink),
+        _ => Err(EUCLEAN),
     }
 }
 
@@ -224,13 +225,21 @@ impl FuseFileSystem for ErofsFuse {
         {
             Ok(inode) => {
                 let mut count = 1;
+                let mut dtype_error: Option<c_int> = None;
                 match self
                     .filesystem
                     .fill_dentries(inode, 0, offset as u64, &mut |dirent, _| {
+                        let ftype = match filetype_from_dtype(dirent.desc().file_type) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                dtype_error = Some(e as c_int);
+                                return true;
+                            }
+                        };
                         if reply.add(
                             nid_to_ino(sb, dirent.desc().nid),
                             count + 1,
-                            filetype_from_dtype(dirent.desc().file_type),
+                            ftype,
                             OsStr::from_bytes(dirent.dirname()),
                         ) {
                             true
@@ -239,7 +248,13 @@ impl FuseFileSystem for ErofsFuse {
                             false
                         }
                     }) {
-                    Ok(()) => reply.ok(),
+                    Ok(()) => {
+                        if let Some(e) = dtype_error {
+                            reply.error(e)
+                        } else {
+                            reply.ok()
+                        }
+                    }
                     Err(e) => reply.error(e as i32),
                 }
             }
@@ -254,18 +269,24 @@ impl FuseFileSystem for ErofsFuse {
         reply: ReplyEntry,
     ) {
         let nid = self.ino_to_nid(parent);
+        let name = match _name.to_str() {
+            Some(name) => name,
+            None => {
+                reply.error(EINVAL as i32);
+                return;
+            }
+        };
         match lookup(
             self.filesystem.as_filesystem(),
             &mut self.collection,
             nid,
-            _name.to_str().unwrap(),
+            name,
         ) {
             Ok(inode) => {
-                reply.entry(
-                    &TTL,
-                    &get_file_attr_from_filesystem_inode(inode, self.filesystem.superblock()),
-                    0,
-                );
+                match get_file_attr_from_filesystem_inode(inode, self.filesystem.superblock()) {
+                    Ok(attr) => reply.entry(&TTL, &attr, 0),
+                    Err(e) => reply.error(e as i32),
+                }
             }
             Err(e) => reply.error(e as i32),
         }
@@ -275,10 +296,10 @@ impl FuseFileSystem for ErofsFuse {
             .collection
             .iget(self.ino_to_nid(ino), self.filesystem.as_filesystem())
         {
-            Ok(inode) => reply.attr(
-                &TTL,
-                &get_file_attr_from_filesystem_inode(inode, self.filesystem.superblock()),
-            ),
+            Ok(inode) => match get_file_attr_from_filesystem_inode(inode, self.filesystem.superblock()) {
+                Ok(attr) => reply.attr(&TTL, &attr),
+                Err(e) => reply.error(e as i32),
+            },
             Err(e) => reply.error(e as i32),
         }
     }
@@ -360,25 +381,39 @@ struct ErofsArgs {
 }
 fn main() {
     let args = ErofsArgs::parse();
-    let file = File::options()
+    let file = match File::options()
         .read(true)
         .write(true)
         .open(Path::new(&args.image))
-        .unwrap();
+    {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("failed to open image '{}': {e}", args.image);
+            process::exit(1);
+        }
+    };
     let filesystem =
-        Box::new(ImageFileSystem::try_new(UncompressedBackend::new(FuseFile(file))).unwrap());
+        match ImageFileSystem::try_new(UncompressedBackend::new(FuseFile(file))) {
+            Ok(fs) => Box::new(fs),
+            Err(e) => {
+                eprintln!("failed to initialize EROFS filesystem: {e:?}");
+                process::exit(1);
+            }
+        };
     let collection = FuseCollection(HashMap::new());
     let erofs_fuse = ErofsFuse {
         filesystem,
         collection,
     };
-    fuser::mount2(
+    if let Err(e) = fuser::mount2(
         erofs_fuse,
         args.mountpoint,
         &[
             MountOption::FSName("erofs_fuse_rs".to_string()),
             MountOption::AutoUnmount,
         ],
-    )
-    .unwrap()
+    ) {
+        eprintln!("failed to mount fuse filesystem: {e}");
+        process::exit(1);
+    }
 }
